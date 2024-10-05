@@ -33,7 +33,7 @@ impl RenderPipelineStage for NearestNeighbourUpsample {
     }
 
     fn process_row_chunk(
-        &mut self,
+        &self,
         _position: (usize, usize),
         xsize: usize,
         row: &mut [(&[&[u8]], &mut [&mut [u8]])],

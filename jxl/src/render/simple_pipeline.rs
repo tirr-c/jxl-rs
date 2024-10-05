@@ -380,7 +380,7 @@ impl RenderPipeline for SimpleRenderPipeline {
 
 pub trait RenderPipelineRunStage {
     fn run_stage_on<S: RenderPipelineStage<Type = Self>>(
-        stage: &mut S,
+        stage: &S,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],
@@ -390,7 +390,7 @@ pub trait RenderPipelineRunStage {
 impl<T: ImageDataType> RenderPipelineRunStage for RenderPipelineInputStage<T> {
     #[instrument(skip_all)]
     fn run_stage_on<S: RenderPipelineStage<Type = Self>>(
-        stage: &mut S,
+        stage: &S,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         _output_buffers: &mut [&mut Image<f64>],
@@ -424,7 +424,7 @@ impl<T: ImageDataType> RenderPipelineRunStage for RenderPipelineInputStage<T> {
 impl<T: ImageDataType> RenderPipelineRunStage for RenderPipelineInPlaceStage<T> {
     #[instrument(skip_all)]
     fn run_stage_on<S: RenderPipelineStage<Type = Self>>(
-        stage: &mut S,
+        stage: &S,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],
@@ -476,7 +476,7 @@ impl<
 {
     #[instrument(skip_all)]
     fn run_stage_on<S: RenderPipelineStage<Type = Self>>(
-        stage: &mut S,
+        stage: &S,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],
@@ -562,7 +562,7 @@ impl<
 impl<T: ImageDataType> RenderPipelineRunStage for RenderPipelineExtendStage<T> {
     #[instrument(skip_all)]
     fn run_stage_on<S: RenderPipelineStage<Type = Self>>(
-        stage: &mut S,
+        stage: &S,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],
@@ -632,7 +632,7 @@ impl<T: ImageDataType> RenderPipelineRunStage for RenderPipelineExtendStage<T> {
 
 trait RunStage: Any + std::fmt::Display {
     fn run_stage_on(
-        &mut self,
+        &self,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],
@@ -647,7 +647,7 @@ trait RunStage: Any + std::fmt::Display {
 
 impl<T: RenderPipelineStage> RunStage for T {
     fn run_stage_on(
-        &mut self,
+        &self,
         chunk_size: usize,
         input_buffers: &[&Image<f64>],
         output_buffers: &mut [&mut Image<f64>],

@@ -80,7 +80,7 @@ pub trait RenderPipelineStage: Any + std::fmt::Display {
     /// Process one chunk of row. The semantics of this function are detailed in the
     /// documentation of the various types of stages.
     fn process_row_chunk(
-        &mut self,
+        &self,
         position: (usize, usize),
         xsize: usize,
         row: &mut [<Self::Type as RenderPipelineStageInfo>::RowType<'_>],
