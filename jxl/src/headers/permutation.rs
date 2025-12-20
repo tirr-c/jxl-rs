@@ -11,6 +11,101 @@ use crate::entropy_coding::decode::SymbolReader;
 use crate::error::{Error, Result};
 use crate::util::{CeilLog2, NewWithCapacity, tracing_wrappers::instrument, value_of_lowest_1_bit};
 
+#[derive(Debug)]
+pub struct IncrementalPermutationReader {
+    size: u32,
+    skip: u32,
+    end: u32,
+    lehmer: Vec<u32>,
+}
+
+impl IncrementalPermutationReader {
+    pub fn new(
+        size: u32,
+        skip: u32,
+        histograms: &Histograms,
+        br: &mut BitReader,
+        entropy_reader: &mut SymbolReader,
+    ) -> Result<Self> {
+        let end = entropy_reader.read_unsigned(histograms, br, get_context(size));
+        if end > size - skip {
+            return Err(Error::InvalidPermutationSize { size, skip, end });
+        }
+
+        Ok(Self {
+            size,
+            skip,
+            end,
+            lehmer: Vec::new_with_capacity(end as usize)?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        histograms: &Histograms,
+        br: &mut BitReader,
+        entropy_reader: &mut SymbolReader,
+    ) -> Result<bool> {
+        let Self {
+            size,
+            skip,
+            end,
+            ref mut lehmer,
+        } = *self;
+
+        let idx = lehmer.len() as u32;
+        if idx >= end {
+            return Ok(true);
+        }
+
+        let prev_val = lehmer.last().copied().unwrap_or(0);
+        let ctx = get_context(prev_val);
+        let val = entropy_reader.read_unsigned(histograms, br, ctx);
+        if let Err(e) = br.check_for_error() {
+            if matches!(e, Error::OutOfBounds(_)) {
+                // Estiate 1.5 bits for each remaining code
+                let bits = (end as usize - lehmer.len()).saturating_mul(3) / 2;
+                return Err(Error::OutOfBounds(bits));
+            }
+            return Err(e);
+        }
+
+        let idx = skip + idx;
+        if val >= size - idx {
+            return Err(Error::InvalidPermutationLehmerCode {
+                size,
+                idx,
+                lehmer: val,
+            });
+        }
+        lehmer.push(val);
+
+        Ok(lehmer.len() >= end as usize)
+    }
+
+    pub fn finalize(self) -> Result<Permutation> {
+        let Self {
+            size,
+            skip,
+            end,
+            lehmer,
+        } = self;
+        assert_eq!(lehmer.len(), end as usize);
+
+        // Initialize the full permutation vector with skipped elements intact
+        let mut permutation = Vec::new_with_capacity(size as usize)?;
+        permutation.extend(0..size);
+
+        // Decode the Lehmer code into the slice starting at `skip`
+        let permuted_slice = decode_lehmer_code(&lehmer, &permutation[skip as usize..])?;
+
+        // Replace the target slice in `permutation`
+        permutation[skip as usize..].copy_from_slice(&permuted_slice);
+
+        Ok(Permutation(Cow::Owned(permutation)))
+    }
+}
+
 #[derive(Debug, PartialEq, Default, Clone)]
 pub struct Permutation(pub Cow<'static, [u32]>);
 
@@ -31,54 +126,10 @@ impl Permutation {
         br: &mut BitReader,
         entropy_reader: &mut SymbolReader,
     ) -> Result<Self> {
-        let end = entropy_reader.read_unsigned(histograms, br, get_context(size));
-        Self::decode_inner(size, skip, end, |ctx| -> Result<u32> {
-            let r = entropy_reader.read_unsigned(histograms, br, ctx);
-            br.check_for_error()?;
-            Ok(r)
-        })
-    }
-
-    fn decode_inner(
-        size: u32,
-        skip: u32,
-        end: u32,
-        mut read: impl FnMut(usize) -> Result<u32>,
-    ) -> Result<Self> {
-        if end > size - skip {
-            return Err(Error::InvalidPermutationSize { size, skip, end });
-        }
-
-        let mut lehmer = Vec::new_with_capacity(end as usize)?;
-
-        let mut prev_val = 0u32;
-        for idx in skip..(skip + end) {
-            let val = read(get_context(prev_val))?;
-            if val >= size - idx {
-                return Err(Error::InvalidPermutationLehmerCode {
-                    size,
-                    idx,
-                    lehmer: val,
-                });
-            }
-            lehmer.push(val);
-            prev_val = val;
-        }
-
-        // Initialize the full permutation vector with skipped elements intact
-        let mut permutation = Vec::new_with_capacity((size - skip) as usize)?;
-        permutation.extend(0..size);
-
-        // Decode the Lehmer code into the slice starting at `skip`
-        let permuted_slice = decode_lehmer_code(&lehmer, &permutation[skip as usize..])?;
-
-        // Replace the target slice in `permutation`
-        permutation[skip as usize..].copy_from_slice(&permuted_slice);
-
-        // Ensure the permutation has the correct size
-        assert_eq!(permutation.len(), size as usize);
-
-        Ok(Self(Cow::Owned(permutation)))
+        let mut reader =
+            IncrementalPermutationReader::new(size, skip, histograms, br, entropy_reader)?;
+        while !reader.step(histograms, br, entropy_reader)? {}
+        reader.finalize()
     }
 
     pub fn compose(&mut self, other: &Permutation) {
