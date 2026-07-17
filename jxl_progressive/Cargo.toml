@@ -1,0 +1,49 @@
+[workspace]
+# This crate is intentionally excluded from the workspace
+
+[package]
+name = "jxl_progressive"
+edition = "2024"
+license = "BSD-3-Clause"
+
+[dependencies]
+bytemuck = "1.14"
+color-eyre = "0.6.5"
+half = "2.4.1"
+moxcms = "0.8.1"
+va_list = "0.2.0"
+
+[dependencies.clap]
+version = "4.5.18"
+features = ["derive"]
+
+[dependencies.jxl]
+path = "../jxl"
+features = ["all-simd"]
+
+[dependencies.tracing-subscriber]
+optional = true
+version = "0.3.18"
+features = ["env-filter"]
+
+[target.'cfg(windows)'.dependencies.rusty_ffmpeg]
+version = "0.17.0"
+features = ["link_vcpkg_ffmpeg"]
+
+[target.'cfg(not(windows))'.dependencies.rusty_ffmpeg]
+version = "0.17.0"
+features = ["link_system_ffmpeg"]
+
+[features]
+tracing-subscriber = ["dep:tracing-subscriber", "jxl/tracing"]
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
