@@ -136,6 +136,8 @@ pub struct DecoderState {
     // If this is set to `true`, early flushing in the main frame
     // (before HF is available) will do nothing.
     pub lf_frame_was_rendered: bool,
+    pub crop: Option<Rect>,
+    pub downsampling: usize,
 }
 
 impl DecoderState {
@@ -176,6 +178,8 @@ impl DecoderState {
             level5_limits,
             sample_limit: options.sample_limit,
             lf_frame_was_rendered: false,
+            crop: None,
+            downsampling: 1,
         }
     }
 

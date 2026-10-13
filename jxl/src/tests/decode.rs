@@ -27,6 +27,8 @@ pub struct DecodeParams<'a, T: ImageDataType = f32> {
     pub pixel_format: Option<JxlPixelFormat>,
     pub alpha_mode: AlphaMode,
     pub adjust_orientation: bool,
+    pub crop: Option<Rect>,
+    pub downsampling: usize,
 }
 
 impl<'a, T: ImageDataType> Default for DecodeParams<'a, T> {
@@ -42,6 +44,8 @@ impl<'a, T: ImageDataType> Default for DecodeParams<'a, T> {
             pixel_format: None,
             alpha_mode: AlphaMode::AsIs,
             adjust_orientation: true,
+            crop: None,
+            downsampling: 1,
         }
     }
 }
@@ -86,7 +90,7 @@ pub fn decode<'a, T: ImageDataType>(
 
     let init = T::from_f64(f64::NAN);
     let make_buffers = |decoder: &JxlDecoder| -> Result<Vec<Image<T>>, Error> {
-        let (w, h) = decoder.basic_info().unwrap().size;
+        let (w, h) = decoder.output_size().unwrap();
         let pixel_format = decoder.current_pixel_format().unwrap();
         let num_channels = pixel_format.color_type.samples_per_pixel();
         assert!(num_channels > 0);
@@ -128,9 +132,20 @@ pub fn decode<'a, T: ImageDataType>(
                 if let Some(ref fmt) = params.pixel_format {
                     decoder.set_pixel_format(fmt.clone())?;
                 }
+                if let Some(crop) = params.crop {
+                    decoder.set_crop(Some(crop))?;
+                }
+                if params.downsampling != 1 {
+                    decoder.set_downsampling(params.downsampling)?;
+                }
                 buffers = Some(make_buffers(&decoder)?);
             }
-            Event::FrameHeader => {}
+            Event::FrameHeader => {
+                assert_eq!(
+                    decoder.frame_header().unwrap().size,
+                    decoder.output_size().unwrap()
+                );
+            }
             Event::FrameComplete { has_more_frames } => {
                 let completed = buffers.take().unwrap();
                 if !allow_partial {
@@ -241,6 +256,59 @@ pub fn image_size(mut input: &[u8]) -> Result<(usize, usize)> {
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
     assert_eq!(decoder.process(&mut input, None, None)?, Event::BasicInfo);
     Ok(decoder.basic_info().unwrap().size)
+}
+
+/// Compare randomly cropped decoding against the corresponding pixels of the full canvas.
+pub fn run_compare_crop(path: &Path) {
+    let data = std::fs::read(path).unwrap();
+    let (w, h) = image_size(&data).unwrap();
+    // A full-canvas crop skips preview frames just like the random crop does.
+    let full = decode::<f32>(
+        &data,
+        DecodeParams {
+            crop: Some(Rect {
+                origin: (0, 0),
+                size: (w, h),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    arbtest::arbtest(|u| {
+        let origin = (u.int_in_range(0..=w - 1)?, u.int_in_range(0..=h - 1)?);
+        let crop = Rect {
+            origin,
+            size: (
+                u.int_in_range(1..=w - origin.0)?,
+                u.int_in_range(1..=h - origin.1)?,
+            ),
+        };
+        for use_simple_pipeline in [false, true] {
+            let frames = decode::<f32>(
+                &data,
+                DecodeParams {
+                    crop: Some(crop),
+                    use_simple_pipeline,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(frames.len(), full.len());
+            for (frame, reference) in frames.iter().zip(&full) {
+                assert_eq!(frame.len(), reference.len());
+                for (image, reference) in frame.iter().zip(reference) {
+                    let samples = reference.size().0 / w;
+                    assert_eq!(image.size(), (crop.size.0 * samples, crop.size.1));
+                    for y in 0..crop.size.1 {
+                        let start = crop.origin.0 * samples;
+                        let row = &reference.row(crop.origin.1 + y)[start..start + image.size().0];
+                        assert_close!(all, image.row(y), row, 1e-5, "{path:?}, {crop:?}, row {y}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
 }
 
 pub fn compute_tile_quartiles(

@@ -864,6 +864,8 @@ impl Frame {
                     (false, Some(c)) => &[0, 1, 2, c],
                 }
             };
+            let api_crop = decoder_state.crop;
+            let api_save_downsample = decoder_state.downsampling.ilog2() as u8;
             if let Some(df) = &pixel_format.color_data_format {
                 if (should_premultiply || should_unpremultiply)
                     && let Some(alpha_channel) = alpha_extra_channel
@@ -880,13 +882,15 @@ impl Frame {
                         should_unpremultiply,
                     ));
                 }
-                pipeline = pipeline.add_save_stage(
+                pipeline = pipeline.add_save_stage_with_crop_downsample(
                     color_source_channels,
                     output_orientation,
                     0,
                     pixel_format.color_type,
                     *df,
                     fill_opaque_alpha,
+                    api_crop,
+                    api_save_downsample,
                 );
             }
             let mut save_idx = if pixel_format.color_data_format.is_some() {
@@ -896,13 +900,15 @@ impl Frame {
             };
             for i in 0..frame_header.num_extra_channels as usize {
                 if let Some(df) = &pixel_format.extra_channel_format[i] {
-                    pipeline = pipeline.add_save_stage(
+                    pipeline = pipeline.add_save_stage_with_crop_downsample(
                         &[3 + i],
                         output_orientation,
                         save_idx,
                         JxlColorType::Grayscale,
                         *df,
                         false,
+                        api_crop,
+                        api_save_downsample,
                     );
                     save_idx += 1;
                 }

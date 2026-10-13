@@ -1802,3 +1802,319 @@ fn test_decoder_reset() {
         Ok(())
     });
 }
+
+#[test]
+fn test_crop_and_downsampling_api_validation() {
+    use crate::api::Rect;
+
+    let file = std::fs::read("resources/test/with_preview.jxl").unwrap();
+    let options = JxlDecoderOptions {
+        skip_preview: false,
+        ..Default::default()
+    };
+    let mut decoder = JxlDecoder::new(options);
+
+    // Calling set_crop / set_downsampling before BasicInfo should fail.
+    assert!(matches!(
+        decoder.set_crop(Some(Rect {
+            origin: (0, 0),
+            size: (10, 10),
+        })),
+        Err(Error::ApiUsageError(_))
+    ));
+    assert!(matches!(
+        decoder.set_downsampling(2),
+        Err(Error::ApiUsageError(_))
+    ));
+    assert_eq!(decoder.output_size(), None);
+
+    let mut input = file.as_slice();
+    assert_eq!(
+        decoder.process(&mut input, None, None).unwrap(),
+        Event::BasicInfo
+    );
+    let (w, h) = decoder.basic_info().unwrap().size;
+    assert_eq!(decoder.output_size(), Some((w, h)));
+
+    // Invalid crop rectangles.
+    assert!(matches!(
+        decoder.set_crop(Some(Rect {
+            origin: (0, 0),
+            size: (0, 10),
+        })),
+        Err(Error::ApiUsageError(_))
+    ));
+    assert!(matches!(
+        decoder.set_crop(Some(Rect {
+            origin: (w - 5, 0),
+            size: (10, 10),
+        })),
+        Err(Error::ApiUsageError(_))
+    ));
+
+    // Invalid downsampling factors.
+    for bad_ds in [0, 3, 5, 7, 12, 128] {
+        assert!(matches!(
+            decoder.set_downsampling(bad_ds),
+            Err(Error::ApiUsageError(_))
+        ));
+    }
+
+    // Valid crop and downsampling.
+    let crop = Rect {
+        origin: (3, 5),
+        size: (25, 19),
+    };
+    decoder.set_crop(Some(crop)).unwrap();
+    decoder.set_downsampling(4).unwrap();
+    assert_eq!(decoder.crop(), Some(crop));
+    assert_eq!(decoder.downsampling(), 4);
+    assert_eq!(
+        decoder.output_size(),
+        Some((25usize.div_ceil(4), 19usize.div_ceil(4)))
+    );
+
+    // Advance to FrameHeader: preview frame must be automatically skipped because crop/ds is set.
+    assert_eq!(
+        decoder.process(&mut input, None, None).unwrap(),
+        Event::FrameHeader
+    );
+    assert_eq!(
+        decoder.frame_header().unwrap().size,
+        (25usize.div_ceil(4), 19usize.div_ceil(4))
+    );
+
+    // Calling set_crop / set_downsampling after FrameHeader should fail.
+    assert!(matches!(
+        decoder.set_crop(None),
+        Err(Error::ApiUsageError(_))
+    ));
+    assert!(matches!(
+        decoder.set_downsampling(1),
+        Err(Error::ApiUsageError(_))
+    ));
+}
+
+fn reference_box_downsample(
+    full_buf: &Image<f32>,
+    full_width: usize,
+    crop: Option<crate::api::Rect>,
+    ds: usize,
+) -> Image<f32> {
+    let full_height = full_buf.size().1;
+    let chans = full_buf.size().0 / full_width;
+    let c = crop.unwrap_or(crate::api::Rect {
+        origin: (0, 0),
+        size: (full_width, full_height),
+    });
+    let out_w = c.size.0.div_ceil(ds);
+    let out_h = c.size.1.div_ceil(ds);
+    let mut out = Image::<f32>::new((out_w * chans, out_h)).unwrap();
+    for oy in 0..out_h {
+        let sy0 = c.origin.1 + oy * ds;
+        let sy1 = (sy0 + ds).min(c.origin.1 + c.size.1);
+        let out_row = out.row_mut(oy);
+        for ox in 0..out_w {
+            let sx0 = c.origin.0 + ox * ds;
+            let sx1 = (sx0 + ds).min(c.origin.0 + c.size.0);
+            let inv_count = 1.0 / ((sy1 - sy0) * (sx1 - sx0)) as f32;
+            for ch in 0..chans {
+                let mut sum = 0.0f32;
+                for sy in sy0..sy1 {
+                    let row = full_buf.row(sy);
+                    for sx in sx0..sx1 {
+                        sum += row[sx * chans + ch];
+                    }
+                }
+                out_row[ox * chans + ch] = sum * inv_count;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn test_downsampling_and_crop_accuracy() {
+    use crate::api::Rect;
+    use crate::tests::decode::compute_mse;
+
+    let files: &[(&str, Option<Rect>, &[usize], f32)] = &[
+        (
+            "resources/test/conformance_test_images/bicycles.jxl",
+            None,
+            &[2, 4, 8, 16, 32, 64],
+            0.008,
+        ),
+        (
+            "resources/test/conformance_test_images/bicycles.jxl",
+            Some(Rect {
+                origin: (270, 260),
+                size: (311, 233),
+            }),
+            &[2, 4, 8, 16],
+            0.008,
+        ),
+        (
+            "resources/test/conformance_test_images/progressive.jxl",
+            Some(Rect {
+                origin: (50, 40),
+                size: (250, 190),
+            }),
+            &[2, 4, 8],
+            0.008,
+        ),
+        (
+            "resources/test/green_queen_modular_e3.jxl",
+            None,
+            &[2, 4, 8, 16],
+            0.01,
+        ),
+        (
+            "resources/test/green_queen_modular_e3.jxl",
+            Some(Rect {
+                origin: (24, 32),
+                size: (180, 150),
+            }),
+            &[2, 4, 8],
+            0.01,
+        ),
+        ("resources/test/squeeze_alpha.jxl", None, &[2, 4, 8], 0.015),
+        (
+            "resources/test/conformance_test_images/upsampling.jxl",
+            None,
+            &[2, 4, 8],
+            0.025,
+        ),
+        (
+            "resources/test/conformance_test_images/bench_oriented_brg.jxl",
+            Some(Rect {
+                origin: (11, 15),
+                size: (95, 83),
+            }),
+            &[2, 4, 8],
+            0.015,
+        ),
+        (
+            "resources/test/cropped_traffic_light.jxl",
+            Some(Rect {
+                origin: (4, 5),
+                size: (20, 18),
+            }),
+            &[2, 4, 8],
+            0.01,
+        ),
+    ];
+
+    for &(path, crop, ds_list, max_mse) in files {
+        let data = std::fs::read(path).unwrap();
+        let full_frames = decode::<f32>(&data, Default::default()).unwrap();
+        let full_size = crate::tests::decode::image_size(&data).unwrap();
+        let crop = crop.map(|c| {
+            let ox = c.origin.0.min(full_size.0 / 4);
+            let oy = c.origin.1.min(full_size.1 / 4);
+            Rect {
+                origin: (ox, oy),
+                size: (
+                    c.size.0.min(full_size.0 - ox).max(1),
+                    c.size.1.min(full_size.1 - oy).max(1),
+                ),
+            }
+        });
+
+        for &ds in ds_list {
+            for use_simple in [false, true] {
+                let ds_frames = decode::<f32>(
+                    &data,
+                    DecodeParams {
+                        use_simple_pipeline: use_simple,
+                        crop,
+                        downsampling: ds,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+                assert_eq!(full_frames.len(), ds_frames.len(), "{path} ds={ds}");
+                for (fi, (full_frame, ds_frame)) in
+                    full_frames.iter().zip(ds_frames.iter()).enumerate()
+                {
+                    let ref_frame: Vec<Image<f32>> = full_frame
+                        .iter()
+                        .map(|buf| reference_box_downsample(buf, full_size.0, crop, ds))
+                        .collect();
+                    let mse = compute_mse(ds_frame, &ref_frame);
+                    assert!(
+                        mse <= max_mse,
+                        "{path} (simple={use_simple}, crop={crop:?}, ds={ds}) frame {fi} MSE {mse} > {max_mse}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_modular_squeeze_downsampling_incremental() {
+    let data = std::fs::read("resources/test/green_queen_modular_e3.jxl").unwrap();
+    let full = decode::<f32>(
+        &data,
+        DecodeParams {
+            downsampling: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chunked = decode::<f32>(
+        &data,
+        DecodeParams {
+            chunk_size: 4096,
+            downsampling: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    compare_frames(
+        Path::new("green_queen_modular_e3_ds4"),
+        0,
+        &full[0],
+        &chunked[0],
+    );
+}
+
+#[test]
+fn test_crop_and_downsampling_data_formats() {
+    use crate::api::Rect;
+
+    let data = std::fs::read("resources/test/cropped_traffic_light.jxl").unwrap();
+    let (w, h) = crate::tests::decode::image_size(&data).unwrap();
+    let crop = Some(Rect {
+        origin: (w / 6, h / 6),
+        size: (w / 2, h / 2),
+    });
+    for ds in [1, 2, 4] {
+        let f32_frames = decode::<f32>(
+            &data,
+            DecodeParams {
+                pixel_format: Some(JxlPixelFormat::rgba_f32(1)),
+                crop,
+                downsampling: ds,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let u8_frames = decode::<u8>(
+            &data,
+            DecodeParams {
+                pixel_format: Some(JxlPixelFormat::rgba8(1)),
+                crop,
+                downsampling: ds,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(f32_frames.len(), u8_frames.len());
+        for (f32_frame, u8_frame) in f32_frames.iter().zip(u8_frames.iter()) {
+            assert_eq!(f32_frame[0].size(), u8_frame[0].size());
+        }
+    }
+}

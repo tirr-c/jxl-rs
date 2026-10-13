@@ -78,6 +78,12 @@ macro_rules! declare_test_file_common {
             }
 
             #[test]
+            fn [<test_compare_crop_ $ident>]() {
+                let path = std::path::Path::new("resources/test/").join($path);
+                crate::tests::decode::run_compare_crop(&path);
+            }
+
+            #[test]
             fn [<test_compare_modular_buffers_ $ident>]() {
                 let path = std::path::Path::new("resources/test/").join($path);
                 crate::tests::compare_modular::run(&path, $checkpoints);
