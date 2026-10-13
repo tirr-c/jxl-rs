@@ -7,32 +7,55 @@ use super::row_buffers::RowBuffer;
 use crate::api::{Endianness, JxlDataFormat};
 use crate::error::Result;
 use crate::headers::Orientation;
+use crate::image::Rect;
 use crate::render::buffer_splitter::OutputChannelRef;
-use crate::render::save::{SaveChannelType, SaveStage};
+use crate::render::save::{
+    SaveChannelType, SaveStage, block_range, downsample_rect, reversed_axes,
+};
 use crate::util::ChannelVec;
 
 mod identity;
 
-// Placeholder slow implementation.
 impl SaveStage {
-    // Takes as input only those channels that are *actually* saved.
+    // Takes only the channels that are actually saved. Row buffers cover group_origin/group_size;
+    // owned_area can be smaller when the computation was expanded to a sampling-grid boundary.
+    // Ownership boundaries must not split a downsampling block (except at the crop/image edge).
     #[allow(clippy::too_many_arguments)]
     pub fn save_lowmem(
         &self,
         data: &[&RowBuffer],
         scratch: &mut [RowBuffer; 4],
+        downsample_scratch: Option<&mut [RowBuffer; 4]>,
         buffers: &mut [Option<OutputChannelRef>],
         group_size: (usize, usize),
-        frame_y: usize,
-        group_origin: (usize, usize),
+        mut frame_y: usize,
+        mut group_origin: (usize, usize),
         full_image_size: (usize, usize),
         frame_origin: (isize, isize),
+        owned_area: Option<Rect>,
     ) -> Result<()> {
         let Some(buf) = buffers[self.output_buffer_index].as_mut() else {
             return Ok(());
         };
 
         let group_y = frame_y - group_origin.1;
+        let source_origin = frame_origin;
+        let crop = self.crop.unwrap_or(Rect {
+            origin: (0, 0),
+            size: full_image_size,
+        });
+
+        let (full_image_size, frame_origin) = if let Some(crop) = self.crop {
+            (
+                crop.size,
+                (
+                    frame_origin.0 - crop.origin.0 as isize,
+                    frame_origin.1 - crop.origin.1 as isize,
+                ),
+            )
+        } else {
+            (full_image_size, frame_origin)
+        };
 
         let relative_full_image_start = (
             -frame_origin.0 - (group_origin.0 as isize),
@@ -44,15 +67,26 @@ impl SaveStage {
             relative_full_image_start.1 + full_image_size.1 as isize,
         );
 
-        let save_start = (
+        let mut save_start = (
             relative_full_image_start.0.max(0) as usize,
             relative_full_image_start.1.max(0) as usize,
         );
 
-        let save_end = (
+        let mut save_end = (
             relative_full_image_end.0.clamp(0, group_size.0 as isize) as usize,
             relative_full_image_end.1.clamp(0, group_size.1 as isize) as usize,
         );
+
+        if let Some(owned) = owned_area {
+            save_start.0 = save_start
+                .0
+                .max(owned.origin.0.saturating_sub(group_origin.0));
+            save_start.1 = save_start
+                .1
+                .max(owned.origin.1.saturating_sub(group_origin.1));
+            save_end.0 = save_end.0.min(owned.end().0.saturating_sub(group_origin.0));
+            save_end.1 = save_end.1.min(owned.end().1.saturating_sub(group_origin.1));
+        }
 
         // If the visible area were empty, we'd have gotten None for the buffer.
         assert!(save_start.0 < save_end.0);
@@ -63,8 +97,81 @@ impl SaveStage {
             return Ok(());
         }
 
-        let relative_y = group_y - save_start.1;
-        let save_size = (save_end.0 - save_start.0, save_end.1 - save_start.1);
+        let mut relative_y = group_y - save_start.1;
+        let mut save_size = (save_end.0 - save_start.0, save_end.1 - save_start.1);
+
+        let mut ds_refs: ChannelVec<&RowBuffer> = ChannelVec::new();
+        let data = if self.save_downsample > 0 {
+            let ds = self.save_downsample;
+            let scale = 1usize << ds;
+            let reversed = reversed_axes(self.orientation);
+            let source_x = group_origin.0 as isize + source_origin.0;
+            let source_y = group_origin.1 as isize + source_origin.1;
+            let source_rect = Rect {
+                origin: (
+                    (source_x + save_start.0 as isize - crop.origin.0 as isize) as usize,
+                    (source_y + save_start.1 as isize - crop.origin.1 as isize) as usize,
+                ),
+                size: save_size,
+            };
+            let output_rect = downsample_rect(source_rect, crop.size, ds, self.orientation);
+            let crop_y = (frame_y as isize + source_origin.1 - crop.origin.1 as isize) as usize;
+            let row_rect = downsample_rect(
+                Rect {
+                    origin: (source_rect.origin.0, crop_y),
+                    size: (source_rect.size.0, 1),
+                },
+                crop.size,
+                ds,
+                self.orientation,
+            );
+            let out_y = row_rect.origin.1;
+            let yr = block_range(out_y, crop.size.1, scale, reversed.1);
+            let is_last_in_block = crop_y + 1 == yr.end;
+            let ds_scratch = downsample_scratch.unwrap();
+            let off = RowBuffer::x0_offset::<f32>();
+
+            for (i, &in_buf) in data.iter().enumerate() {
+                debug_assert_eq!(self.channel_types[i], SaveChannelType::F32);
+                let src_row = in_buf.get_row::<f32>(frame_y);
+                let ds_row =
+                    &mut ds_scratch[i].get_row_mut::<f32>(0)[off..off + output_rect.size.0];
+                if crop_y == yr.start {
+                    ds_row.fill(0.0);
+                }
+                for (bx, dst_val) in ds_row.iter_mut().enumerate() {
+                    let xr = block_range(output_rect.origin.0 + bx, crop.size.0, scale, reversed.0);
+                    let x0 = (crop.origin.0 as isize + xr.start as isize - source_x) as usize;
+                    let x1 = (crop.origin.0 as isize + xr.end as isize - source_x) as usize;
+                    debug_assert!(x0 >= save_start.0 && x1 <= save_end.0);
+                    let mut row_sum = 0.0f32;
+                    for &v in &src_row[off + x0..off + x1] {
+                        row_sum += v;
+                    }
+                    *dst_val += row_sum;
+                    if is_last_in_block {
+                        *dst_val *= 1.0 / ((x1 - x0) * yr.len()) as f32;
+                    }
+                }
+            }
+
+            if !is_last_in_block {
+                return Ok(());
+            }
+
+            for s in &ds_scratch[..data.len()] {
+                ds_refs.push(s);
+            }
+            frame_y = out_y;
+            group_origin.0 = output_rect.origin.0;
+            save_start = (0, 0);
+            save_end = output_rect.size;
+            relative_y = out_y - output_rect.origin.1;
+            save_size = output_rect.size;
+            &ds_refs[..]
+        } else {
+            data
+        };
 
         let output_y = match self.orientation {
             Orientation::Identity => Some(relative_y),

@@ -284,15 +284,17 @@ impl<'a> BufferFiller<'a> {
 }
 
 impl LowMemoryRenderPipeline {
-    // Renders *parts* of group's worth of data.
-    // In particular, renders the sub-rectangle given in `image_area`, where (1, 1) refers to
-    // the center of the group, and 0 and 2 include data from the neighbouring group (if any).
+    // Compute the sampling-grid-aligned image_area, but save only owned_area (both frame-local).
+    // A downsampled post-extend output owns extended_area in canvas coordinates instead: edge
+    // jobs also assemble the background pixels needed to finish their downsampling blocks.
     #[instrument(skip(self, buffers))]
     pub(super) fn render_group(
         &self,
         data: &mut LowMemoryRenderPipelinePerThread,
         (gx, gy): (usize, usize),
         image_area: Rect,
+        owned_area: Rect,
+        extended_area: Option<Rect>,
         buffers: &mut [Option<OutputChannelRef>],
     ) -> Result<()> {
         let start_of_row = image_area.origin.0 == 0;
@@ -304,7 +306,18 @@ impl LowMemoryRenderPipeline {
         } = image_area;
 
         let num_channels = self.shared.num_channels();
-        let num_extra_rows = self.border_size.1;
+        let num_extra_rows = self.base_border_size.1;
+        let has_unscaled_outputs = self
+            .save_buffer_info
+            .iter()
+            .zip(buffers.iter())
+            .any(|(info, buf)| info.is_some_and(|i| i.save_downsample == 0) && buf.is_some());
+        let extended_area = extended_area.filter(|_| {
+            self.save_buffer_info
+                .iter()
+                .zip(buffers.iter())
+                .any(|(info, buf)| info.is_some_and(|i| i.save_downsample > 0) && buf.is_some())
+        });
 
         // This follows the same implementation strategy as the C++ code in libjxl.
         // We pretend that every stage has a vertical shift of 0, i.e. it is as tall
@@ -333,6 +346,16 @@ impl LowMemoryRenderPipeline {
 
         let mut previous_call_was_previous_row: SmallVec<bool, 32> =
             std::iter::repeat_n(false, self.shared.stages.len()).collect();
+
+        if let Some(area) = extended_area {
+            let Stage::Extend(e) = &self.shared.stages[self.shared.extend_stage_index.unwrap()]
+            else {
+                unreachable!()
+            };
+            for y in area.origin.1..area.end().1.min(e.frame_origin.1.max(0) as usize) {
+                self.render_extended_output_row(data, area, y, None, buffers)?;
+            }
+        }
 
         for vy in vy0..vy1 {
             let mut current_origin = (0, 0);
@@ -380,7 +403,9 @@ impl LowMemoryRenderPipeline {
                 if matches!(stage, Stage::Save(_)) {
                     // Save stages write to shared output buffers, so they must only
                     // process rows owned by this rect; keep ceil semantics for them.
-                    if stage_vy - (y0 as isize) < -(scaled_y_border as isize) {
+                    if y < owned_area.origin.1.shrc(dy) as isize
+                        || y >= owned_area.end().1.shrc(dy) as isize
+                    {
                         continue;
                     }
                 } else if y < (y0 as isize - scaled_y_border as isize) >> dy {
@@ -421,8 +446,10 @@ impl LowMemoryRenderPipeline {
                         );
                     }
                     Stage::Save(s) => {
-                        // Find buffers for channels that will be saved.
-                        // Channel ordering is handled in stage_input_buffer_index construction.
+                        if extended_area.is_some() && s.save_downsample > 0 {
+                            continue;
+                        }
+                        // Save only owned pixels, not the extra computation halo.
                         let input_data: ChannelVec<_> = self.stage_input_buffer_index[i]
                             .iter()
                             .map(|(si, ci)| &data.row_buffers[*si][*ci])
@@ -430,17 +457,40 @@ impl LowMemoryRenderPipeline {
                         s.save_lowmem(
                             &input_data,
                             data.save_scratch.as_mut().unwrap(),
+                            data.downsample_scratch[i].as_mut(),
                             &mut *buffers,
                             (xsize >> dx, num_rows >> dy),
                             y,
                             (x0 >> dx, y0 >> dy),
                             current_size,
                             current_origin,
+                            Some(owned_area.downsample((dx as u8, dy as u8))),
                         )?;
                     }
                     Stage::Extend(s) => {
                         current_size = s.image_size;
                         current_origin = s.frame_origin;
+                        if let Some(area) = extended_area {
+                            let canvas_y = y as isize + s.frame_origin.1;
+                            if y >= owned_area.origin.1
+                                && y < owned_area.end().1
+                                && canvas_y >= area.origin.1 as isize
+                                && canvas_y < area.end().1 as isize
+                            {
+                                self.render_extended_output_row(
+                                    data,
+                                    area,
+                                    canvas_y as usize,
+                                    Some((image_area, y)),
+                                    buffers,
+                                )?;
+                            }
+                            if !has_unscaled_outputs {
+                                // The output suffix was run on the assembled row above. No
+                                // reference saves need the original, frame-local suffix.
+                                break;
+                            }
+                        }
                     }
                     Stage::InOut(s) => {
                         let borderx = s.border().0 as usize;
@@ -507,16 +557,86 @@ impl LowMemoryRenderPipeline {
                 }
             }
         }
+        if let Some(area) = extended_area {
+            let Stage::Extend(e) = &self.shared.stages[self.shared.extend_stage_index.unwrap()]
+            else {
+                unreachable!()
+            };
+            let frame_end = (e.frame_origin.1 + self.shared.input_size.1 as isize).max(0) as usize;
+            for y in area.origin.1.max(frame_end)..area.end().1 {
+                self.render_extended_output_row(data, area, y, None, buffers)?;
+            }
+        }
         Ok(())
     }
 
-    // Renders a chunk of data outside the current frame.
+    /// Assemble a final canvas row before running the post-extend suffix. Foreground rows have
+    /// already been upsampled and blended; only background pieces come from Extend. The separate
+    /// one-row buffers preserve prefix filter history and leave reference-frame saves untouched.
+    pub(super) fn render_extended_output_row(
+        &self,
+        data: &mut LowMemoryRenderPipelinePerThread,
+        area: Rect,
+        y: usize,
+        foreground: Option<(Rect, usize)>,
+        buffers: &mut [Option<OutputChannelRef>],
+    ) -> Result<()> {
+        if area.size.0 == 0 || area.size.1 == 0 {
+            return Ok(());
+        }
+        let extend_idx = self.shared.extend_stage_index.unwrap();
+        let Stage::Extend(e) = &self.shared.stages[extend_idx] else {
+            unreachable!()
+        };
+        let off = RowBuffer::x0_offset::<f32>();
+        for c in 0..self.shared.num_channels() {
+            if !self.shared.channel_is_used[c] {
+                continue;
+            }
+            let (si, ci) = self.stage_input_buffer_index[extend_idx][c];
+            let row = &mut data.extended_rows[si][ci].get_row_mut::<f32>(y)[off..off + area.size.0];
+            if let Some((rendered, frame_y)) = foreground {
+                let frame_x0 = e.frame_origin.0.max(area.origin.0 as isize) as usize;
+                let frame_x1 = (e.frame_origin.0 + self.shared.input_size.0 as isize)
+                    .min(area.end().0 as isize)
+                    .max(frame_x0 as isize) as usize;
+                let left = frame_x0 - area.origin.0;
+                let right = frame_x1 - area.origin.0;
+                if left > 0 {
+                    e.process_row_chunk((area.origin.0, y), left, c, &mut row[..left]);
+                }
+                if right < area.size.0 {
+                    e.process_row_chunk((frame_x1, y), area.size.0 - right, c, &mut row[right..]);
+                }
+                if left < right {
+                    let source_x =
+                        (frame_x0 as isize - e.frame_origin.0) as usize - rendered.origin.0;
+                    row[left..right].copy_from_slice(
+                        &data.row_buffers[si][ci].get_row::<f32>(frame_y)
+                            [off + source_x..off + source_x + right - left],
+                    );
+                }
+            } else {
+                e.process_row_chunk((area.origin.0, y), area.size.0, c, row);
+            }
+        }
+        self.render_outside_frame_internal(
+            data,
+            area.origin.0..area.end().0,
+            area.origin.1..area.end().1,
+            Some(y),
+            buffers,
+        )
+    }
+
+    // Renders background strips, or a preassembled extended_rows row when assembled_y is set.
     #[instrument(skip(self, buffers))]
     pub(super) fn render_outside_frame_internal(
         &self,
         data: &mut LowMemoryRenderPipelinePerThread,
         xrange: Range<usize>,
         yrange: Range<usize>,
+        assembled_y: Option<usize>,
         buffers: &mut [Option<OutputChannelRef>],
     ) -> Result<()> {
         let num_channels = self.shared.num_channels();
@@ -524,14 +644,25 @@ impl LowMemoryRenderPipeline {
         let y0 = yrange.start;
         let xsize = xrange.clone().count();
         let ysize = yrange.clone().count();
-        let mut previous_call_was_previous_row: SmallVec<bool, 32> =
-            std::iter::repeat_n(false, self.shared.stages.len()).collect();
+        let mut previous_call_was_previous_row: SmallVec<bool, 32> = std::iter::repeat_n(
+            assembled_y.is_some_and(|y| y > y0),
+            self.shared.stages.len(),
+        )
+        .collect();
 
         // Significantly simplified version of render_group.
-        for y in yrange.clone() {
-            let extend = self.shared.extend_stage_index.unwrap();
-            // Step 1: get padding from extend stage.
+        let extend_idx = self.shared.extend_stage_index.unwrap();
+        let Stage::Extend(extend_stage) = &self.shared.stages[extend_idx] else {
+            unreachable!("extend stage is not an extend stage");
+        };
+        let full_image_size = extend_stage.image_size;
+        for y in assembled_y.map_or(yrange.clone(), |y| y..y + 1) {
+            let extend = extend_idx;
+            // Step 1: get padding from extend stage unless foreground was already assembled.
             for c in 0..num_channels {
+                if assembled_y.is_some() {
+                    break;
+                }
                 let (si, ci) = self.stage_input_buffer_index[extend][c];
                 let buffer = &mut data.row_buffers[si][ci];
                 let Stage::Extend(extend) = &self.shared.stages[extend] else {
@@ -540,16 +671,19 @@ impl LowMemoryRenderPipeline {
                 let row = &mut buffer.get_row_mut(y)[RowBuffer::x0_offset::<f32>()..];
                 extend.process_row_chunk((x0, y), xsize, c, row);
             }
+            let row_buffers = if assembled_y.is_some() {
+                &mut data.extended_rows
+            } else {
+                &mut data.row_buffers
+            };
             // Step 2: go through remaining stages one by one.
             for (i, stage) in self.shared.stages.iter().enumerate().skip(extend + 1) {
                 assert_eq!(self.downsampling_for_stage[i], (0, 0));
 
                 match stage {
                     Stage::InPlace(s) => {
-                        let mut buffers = get_distinct_indices(
-                            &mut data.row_buffers,
-                            &self.sorted_buffer_indices[i],
-                        );
+                        let mut buffers =
+                            get_distinct_indices(row_buffers, &self.sorted_buffer_indices[i]);
                         let prev = std::mem::replace(&mut previous_call_was_previous_row[i], true);
                         s.run_stage_on(
                             ExtraInfo {
@@ -557,9 +691,9 @@ impl LowMemoryRenderPipeline {
                                 current_row: y,
                                 group_x0: x0,
                                 out_extra_x: 0,
-                                start_of_row: false,
-                                end_of_row: false,
-                                image_height: self.shared.input_size.1,
+                                start_of_row: x0 == 0,
+                                end_of_row: xrange.end == full_image_size.0,
+                                image_height: full_image_size.1,
                                 previous_call_was_previous_row: prev,
                             },
                             &mut buffers,
@@ -567,21 +701,26 @@ impl LowMemoryRenderPipeline {
                         );
                     }
                     Stage::Save(s) => {
+                        if (s.save_downsample > 0) != assembled_y.is_some() {
+                            continue;
+                        }
                         // Find buffers for channels that will be saved.
                         // Channel ordering is handled in stage_input_buffer_index construction.
                         let input_data: ChannelVec<_> = self.stage_input_buffer_index[i]
                             .iter()
-                            .map(|(si, ci)| &data.row_buffers[*si][*ci])
+                            .map(|(si, ci)| &row_buffers[*si][*ci])
                             .collect();
                         s.save_lowmem(
                             &input_data,
                             data.save_scratch.as_mut().unwrap(),
+                            data.downsample_scratch[i].as_mut(),
                             &mut *buffers,
                             (xsize, ysize),
                             y,
                             (x0, y0),
-                            (xrange.end, yrange.end), // this is not true, but works out correctly.
+                            full_image_size,
                             (0, 0),
+                            None,
                         )?;
                     }
                     Stage::Extend(_) => {
@@ -589,7 +728,7 @@ impl LowMemoryRenderPipeline {
                     }
                     Stage::InOut(s) => {
                         assert_eq!(s.border(), (0, 0));
-                        let (inb, outb) = data.row_buffers.split_at_mut(i + 1);
+                        let (inb, outb) = row_buffers.split_at_mut(i + 1);
                         // Prepare pointers to input and output buffers.
                         let input_data: ChannelVec<_> = self.stage_input_buffer_index[i]
                             .iter()
@@ -602,9 +741,9 @@ impl LowMemoryRenderPipeline {
                                 current_row: y,
                                 group_x0: x0,
                                 out_extra_x: 0,
-                                start_of_row: false,
-                                end_of_row: false,
-                                image_height: self.shared.input_size.1,
+                                start_of_row: x0 == 0,
+                                end_of_row: xrange.end == full_image_size.0,
+                                image_height: full_image_size.1,
                                 previous_call_was_previous_row: prev,
                             },
                             &input_data,

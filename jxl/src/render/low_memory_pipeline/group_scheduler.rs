@@ -70,6 +70,22 @@ fn foreach_ready_rect(
     Ok(())
 }
 
+pub(super) fn align_down(p: usize, scale: usize, phase: usize) -> usize {
+    let p = p as isize;
+    let phase = (phase % scale) as isize;
+    (phase + (p - phase).div_euclid(scale as isize) * scale as isize).max(0) as usize
+}
+
+pub(super) fn align_up(p: usize, scale: usize, phase: usize) -> usize {
+    let phase = phase % scale;
+    if p <= phase {
+        phase
+    } else {
+        phase + (p - phase).div_ceil(scale) * scale
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn boundary_points(
     origin: usize,
     end: usize,
@@ -77,28 +93,33 @@ fn boundary_points(
     is_last: bool,
     border: usize,
     input_size: usize,
+    scale: usize,
+    crop_origin: usize,
 ) -> [usize; 4] {
     let p0 = if is_first {
         origin
     } else {
-        origin.saturating_sub(border)
+        align_down(origin.saturating_sub(border), scale, crop_origin)
     };
-    let p1 = (origin + border).min(end);
-    let p2 = end.saturating_sub(border).max(p1);
+    let p1 = align_up(origin + border, scale, crop_origin).min(end);
+    let p2 = align_down(end.saturating_sub(border), scale, crop_origin).max(p1);
     let p3 = if is_last {
         end
     } else {
-        (end + border).min(input_size)
+        align_up(end + border, scale, crop_origin).min(input_size)
     };
     [p0, p1, p2, p3]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ready_image_area(
     group_rect: Rect,
     group_position: (usize, usize),
     group_count: (usize, usize),
     input_size: (usize, usize),
     border_size: (usize, usize),
+    scale: (usize, usize),
+    crop_origin: (usize, usize),
     xrange: Range<u8>,
     yrange: Range<u8>,
 ) -> Option<Rect> {
@@ -110,6 +131,8 @@ fn ready_image_area(
         gx + 1 == group_count.0,
         border_size.0,
         input_size.0,
+        scale.0,
+        crop_origin.0,
     );
     let ys = boundary_points(
         group_rect.origin.1,
@@ -118,6 +141,8 @@ fn ready_image_area(
         gy + 1 == group_count.1,
         border_size.1,
         input_size.1,
+        scale.1,
+        crop_origin.1,
     );
 
     let x0 = xs[xrange.start as usize];
@@ -132,6 +157,66 @@ fn ready_image_area(
 }
 
 impl LowMemoryRenderPipeline {
+    fn aligned_render_area(&self, area: Rect) -> Rect {
+        let origin = (
+            area.origin.0 / self.render_align.0 * self.render_align.0,
+            area.origin.1 / self.render_align.1 * self.render_align.1,
+        );
+        let end = (
+            area.end()
+                .0
+                .next_multiple_of(self.render_align.0)
+                .min(self.shared.input_size.0),
+            area.end()
+                .1
+                .next_multiple_of(self.render_align.1)
+                .min(self.shared.input_size.1),
+        );
+        Rect {
+            origin,
+            size: (end.0 - origin.0, end.1 - origin.1),
+        }
+    }
+
+    /// Output ownership is in canvas coordinates. Edge jobs also own the background portion of
+    /// blocks intersecting the current frame; pure-background jobs stop at these block boundaries.
+    pub(super) fn extended_output_area(&self, area: Rect) -> Rect {
+        let Stage::Extend(e) = &self.shared.stages[self.shared.extend_stage_index.unwrap()] else {
+            unreachable!()
+        };
+        let mut origin = (
+            (area.origin.0 as isize + e.frame_origin.0).clamp(0, e.image_size.0 as isize) as usize,
+            (area.origin.1 as isize + e.frame_origin.1).clamp(0, e.image_size.1 as isize) as usize,
+        );
+        let mut end = (
+            (area.end().0 as isize + e.frame_origin.0).clamp(0, e.image_size.0 as isize) as usize,
+            (area.end().1 as isize + e.frame_origin.1).clamp(0, e.image_size.1 as isize) as usize,
+        );
+        if origin.0 == end.0 || origin.1 == end.1 {
+            return Rect {
+                origin,
+                size: (0, 0),
+            };
+        }
+        let scale = 1usize << self.save_downsample;
+        if area.origin.0 == 0 {
+            origin.0 = align_down(origin.0, scale, self.save_crop_origin.0);
+        }
+        if area.origin.1 == 0 {
+            origin.1 = align_down(origin.1, scale, self.save_crop_origin.1);
+        }
+        if area.end().0 == self.shared.input_size.0 {
+            end.0 = align_up(end.0, scale, self.save_crop_origin.0).min(e.image_size.0);
+        }
+        if area.end().1 == self.shared.input_size.1 {
+            end.1 = align_up(end.1, scale, self.save_crop_origin.1).min(e.image_size.1);
+        }
+        Rect {
+            origin,
+            size: (end.0 - origin.0, end.1 - origin.1),
+        }
+    }
+
     pub(super) fn render_with_new_group(
         &self,
         g: usize,
@@ -227,23 +312,62 @@ impl LowMemoryRenderPipeline {
                 (gx, gy),
                 self.shared.group_count,
                 self.shared.input_size,
-                self.border_size,
+                self.base_border_size,
+                self.save_align,
+                (
+                    (self.save_crop_origin.0 as isize - origin.0)
+                        .rem_euclid(self.save_align.0 as isize) as usize,
+                    (self.save_crop_origin.1 as isize - origin.1)
+                        .rem_euclid(self.save_align.1 as isize) as usize,
+                ),
                 xrange,
                 yrange,
             ) else {
                 return Ok(());
             };
 
+            let extended_area =
+                if self.save_downsample > 0 && self.shared.extend_stage_index.is_some() {
+                    Some(self.extended_output_area(image_area))
+                } else {
+                    None
+                };
+            let infos: Vec<_> = self
+                .save_buffer_info
+                .iter()
+                .map(|info| info.filter(|i| extended_area.is_none() || i.save_downsample == 0))
+                .collect();
             let mut local_buffers = buffer_splitter.get_local_buffers(
-                &self.save_buffer_info,
+                &infos,
                 image_area,
                 false,
                 self.shared.input_size,
                 size,
                 origin,
             );
-
-            self.render_group(&mut data, (gx, gy), image_area, &mut local_buffers)?;
+            if let Some(area) = extended_area {
+                let infos: Vec<_> = self
+                    .save_buffer_info
+                    .iter()
+                    .map(|info| info.filter(|i| i.save_downsample > 0))
+                    .collect();
+                let mut outputs =
+                    buffer_splitter.get_local_buffers(&infos, area, true, size, size, (0, 0));
+                for (dst, src) in local_buffers.iter_mut().zip(outputs.iter_mut()) {
+                    if src.is_some() {
+                        *dst = src.take();
+                    }
+                }
+            }
+            let render_area = self.aligned_render_area(image_area);
+            self.render_group(
+                &mut data,
+                (gx, gy),
+                render_area,
+                image_area,
+                extended_area,
+                &mut local_buffers,
+            )?;
             Ok(())
         })?;
 
@@ -317,6 +441,8 @@ mod tests {
             (2, 2),
             (520, 520),
             (18, 18),
+            (1, 1),
+            (0, 0),
             0..1,
             0..1,
         );
@@ -342,6 +468,8 @@ mod tests {
             (3, 2),
             (513, 321),
             (3, 3),
+            (1, 1),
+            (0, 0),
             1..3,
             0..2,
         );

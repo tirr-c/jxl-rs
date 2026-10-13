@@ -6,7 +6,8 @@
 use crate::api::{JxlColorType, JxlDataFormat, JxlOutputBuffer};
 use crate::error::{Error, Result};
 use crate::headers::Orientation;
-use crate::image::DataTypeTag;
+use crate::image::{DataTypeTag, Rect};
+use crate::util::ShiftRightCeil;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveChannelType {
@@ -36,6 +37,59 @@ pub struct SaveStage {
     /// When true, fill alpha channel with opaque (1.0) values.
     /// Used when RGBA output is requested but image has no alpha channel.
     pub(super) fill_opaque_alpha: bool,
+    pub(super) crop: Option<Rect>,
+    pub(super) save_downsample: u8,
+}
+
+/// Whether the source axes are reversed by the output orientation. Reversed axes have their
+/// short downsampling block at the beginning, not at the end, of the source crop.
+pub(super) fn reversed_axes(orientation: Orientation) -> (bool, bool) {
+    use Orientation::*;
+    (
+        matches!(
+            orientation,
+            FlipHorizontal | Rotate180 | AntiTranspose | Rotate90Ccw
+        ),
+        matches!(
+            orientation,
+            FlipVertical | Rotate180 | Rotate90Cw | AntiTranspose
+        ),
+    )
+}
+
+pub(super) fn block_range(
+    index: usize,
+    len: usize,
+    scale: usize,
+    reversed: bool,
+) -> std::ops::Range<usize> {
+    if reversed {
+        let n = len.div_ceil(scale);
+        len.saturating_sub((n - index) * scale)..len.saturating_sub((n - index - 1) * scale)
+    } else {
+        index * scale..((index + 1) * scale).min(len)
+    }
+}
+
+/// Maps a crop-relative source rect to source-axis output block indices. Orientation is applied
+/// afterwards; doing the rounding in display coordinates preserves crop-then-downsample semantics.
+pub(super) fn downsample_rect(
+    rect: Rect,
+    size: (usize, usize),
+    shift: u8,
+    orientation: Orientation,
+) -> Rect {
+    let oriented = orientation.display_rect(rect, size);
+    let origin = (oriented.origin.0 >> shift, oriented.origin.1 >> shift);
+    let end = (oriented.end().0.shrc(shift), oriented.end().1.shrc(shift));
+    let output_size = orientation.map_size((size.0.shrc(shift), size.1.shrc(shift)));
+    orientation.inverse().display_rect(
+        Rect {
+            origin,
+            size: (end.0 - origin.0, end.1 - origin.1),
+        },
+        output_size,
+    )
 }
 
 impl SaveStage {
@@ -65,7 +119,28 @@ impl SaveStage {
             color_type,
             data_format,
             fill_opaque_alpha,
+            crop: None,
+            save_downsample: 0,
         }
+    }
+
+    pub fn with_crop_and_downsample(mut self, crop: Option<Rect>, save_downsample: u8) -> Self {
+        self.crop = crop;
+        self.save_downsample = save_downsample;
+        self
+    }
+
+    pub(super) fn sampling_grid(&self, size: (usize, usize)) -> (usize, usize) {
+        let crop = self.crop.unwrap_or(Rect {
+            origin: (0, 0),
+            size,
+        });
+        let scale = 1usize << self.save_downsample;
+        let reversed = reversed_axes(self.orientation);
+        (
+            crop.origin.0 + if reversed.0 { crop.size.0 % scale } else { 0 },
+            crop.origin.1 + if reversed.1 { crop.size.1 % scale } else { 0 },
+        )
     }
 
     pub fn set_channel_type(&mut self, c: usize, ty: SaveChannelType) {
@@ -98,7 +173,12 @@ impl SaveStage {
         let Some(buf) = buffer else {
             return Ok(());
         };
-        let osize = self.orientation.map_size(size);
+        let target_size = self.crop.map_or(size, |r| r.clip(size).size);
+        let ds_size = (
+            target_size.0.shrc(self.save_downsample),
+            target_size.1.shrc(self.save_downsample),
+        );
+        let osize = self.orientation.map_size(ds_size);
 
         let expected_w = self.output_channels() * self.data_format.bytes_per_sample() * osize.0;
 
