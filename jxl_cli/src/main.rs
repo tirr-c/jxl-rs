@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use jxl::api::{Event, JxlDecoder, JxlDecoderOptions, ProfileLevel};
+use jxl::api::{Event, JxlDecoder, JxlDecoderOptions, ProfileLevel, Rect};
 use jxl_cli::dec;
 use jxl_cli::dec::OutputDataType;
 use jxl_cli::enc::OutputFormat;
@@ -21,6 +21,34 @@ const VERSION_STRING: &str = concat!(
     env!("VERGEN_RUSTC_SEMVER"),
     ")"
 );
+
+fn parse_crop(s: &str) -> std::result::Result<Rect, String> {
+    let invalid = || format!("Invalid crop rectangle '{s}': expected WxH+X0+Y0 or x0,y0,w,h");
+    let parts: [&str; 4] = if let Some((wh, xy)) = s.split_once('+') {
+        let (w, h) = wh.split_once('x').ok_or_else(invalid)?;
+        let (x0, y0) = xy.split_once('+').ok_or_else(invalid)?;
+        [x0, y0, w, h]
+    } else {
+        s.split(',')
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| invalid())?
+    };
+    let [x0, y0, w, h] = parts.map(|part| {
+        part.parse::<usize>()
+            .map_err(|e| format!("Invalid crop rectangle '{s}': {e}"))
+    });
+    let (x0, y0, w, h) = (x0?, y0?, w?, h?);
+    if w == 0 || h == 0 {
+        return Err(format!(
+            "Crop rectangle '{s}' width and height must be non-zero"
+        ));
+    }
+    Ok(Rect {
+        origin: (x0, y0),
+        size: (w, h),
+    })
+}
 
 #[derive(Parser)]
 #[command(version = VERSION_STRING)]
@@ -90,6 +118,14 @@ struct Opt {
     /// Allow Level 10 limits instead of the default Level 5 limits.
     #[clap(long)]
     allow_level10: bool,
+
+    /// Crop rectangle in full-resolution oriented image coordinates (x0,y0,w,h or WxH+X0+Y0).
+    #[clap(long, value_parser = parse_crop)]
+    crop: Option<Rect>,
+
+    /// Downsampling factor (1, 2, 4, 8, 16, 32, or 64).
+    #[clap(long, default_value_t = 1)]
+    downsampling: usize,
 }
 
 fn save_icc(icc_bytes: &[u8], icc_filename: Option<&PathBuf>) -> Result<()> {
@@ -179,7 +215,7 @@ fn main() -> Result<()> {
             let linear_output = matches!(output_format, Some(OutputFormat::Exr));
             #[cfg(not(feature = "exr"))]
             let linear_output = false;
-            let (mut output, duration) = dec::decode_frames(
+            let (mut output, duration) = dec::decode_frames_with_crop_and_downsampling(
                 $input,
                 &mut decoder,
                 opt.override_bitdepth,
@@ -193,6 +229,8 @@ fn main() -> Result<()> {
                 opt.render_interval,
                 opt.allow_partial_files,
                 $prev_output,
+                opt.crop,
+                opt.downsampling,
             )?;
             if opt.preview {
                 output.frames.truncate(1);
