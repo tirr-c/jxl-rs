@@ -347,27 +347,17 @@ pub struct Frame {
 
 impl Frame {
     pub fn max_needed_passes(&self) -> usize {
-        let num_passes = self.header.passes.num_passes as usize;
-        if !self.header.is_leaf() || self.decoder_state.downsampling <= 1 {
-            return num_passes;
-        }
-        let rem_ds = (self.decoder_state.downsampling / self.header.upsampling as usize).max(1);
-        if rem_ds <= 1 {
-            return num_passes;
-        }
-        if self.header.encoding == Encoding::VarDCT {
-            let vardct_passes = if rem_ds >= 8 {
-                0
-            } else {
-                self.header.passes.num_passes_for_downsampling(rem_ds)
-            };
-            if self.header.num_extra_channels > 0 {
-                vardct_passes.max(num_passes)
-            } else {
-                vardct_passes
-            }
+        let decode_ds = if self.header.is_leaf() {
+            (self.decoder_state.downsampling / self.header.upsampling as usize).max(1)
         } else {
-            num_passes
+            1
+        };
+        if self.header.encoding == Encoding::VarDCT && decode_ds >= 8 {
+            // TODO(tirr-c): This will discard extra channel data even if all data is in PassGroups.
+            // Consider handling VarDCT color channels and extra channels differently
+            0
+        } else {
+            self.header.passes.num_passes_for_downsampling(decode_ds)
         }
     }
 
@@ -438,6 +428,12 @@ impl Frame {
         let cx1 = (crop.origin.0 + crop.size.0) as isize + halo;
         let cy1 = (crop.origin.1 + crop.size.1) as isize + halo;
         gx0 < cx1 && gx1 > cx0 && gy0 < cy1 && gy1 > cy0
+    }
+
+    pub fn has_skipped_hf_channels(&self) -> bool {
+        self.lf_global
+            .as_ref()
+            .is_some_and(|lfg| lfg.modular_global.has_skipped_hf_channels())
     }
 
     pub fn toc(&self) -> &Toc {
